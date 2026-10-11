@@ -58,6 +58,7 @@
 #include "log.h"
 #include "maincpu.h"
 #include "machine.h"
+#include "monitor.h"
 #ifdef HAVE_NETWORK
 #include "monitor_network.h"
 #include "monitor_binary.h"
