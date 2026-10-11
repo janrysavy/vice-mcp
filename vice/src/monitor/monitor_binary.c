@@ -40,6 +40,8 @@
 #include "lib.h"
 #include "log.h"
 #include "kbdbuf.h"
+#include "keyboard.h"
+#include "joystick.h"
 #include "monitor.h"
 #include "monitor_binary.h"
 #include "montypes.h"
@@ -116,6 +118,8 @@ enum t_binary_command {
     e_MON_CMD_PALETTE_GET = 0x91,
 
     e_MON_CMD_JOYPORT_SET = 0xa2,
+    e_MON_CMD_KEY_MATRIX_SET = 0xa3,
+    e_MON_CMD_JOYSTICK_VALUE_SET = 0xa4,
 
     e_MON_CMD_USERPORT_SET = 0xb2,
 
@@ -165,6 +169,8 @@ enum t_binary_response {
     e_MON_RESPONSE_PALETTE_GET = 0x91,
 
     e_MON_RESPONSE_JOYPORT_SET = 0xa2,
+    e_MON_RESPONSE_KEY_MATRIX_SET = 0xa3,
+    e_MON_RESPONSE_JOYSTICK_VALUE_SET = 0xa4,
 
     e_MON_RESPONSE_USERPORT_SET = 0xb2,
 
@@ -1398,6 +1404,47 @@ static void monitor_binary_process_joyport_set(binary_command_t *command)
     monitor_binary_response(0, e_MON_RESPONSE_JOYPORT_SET, e_MON_ERR_OK, command->request_id, NULL);
 }
 
+/* Set a physical C64 key-matrix contact, unlike KERNAL keyboard-buffer feed. */
+static void monitor_binary_process_key_matrix_set(binary_command_t *command)
+{
+    uint8_t row, column, pressed;
+
+    if (command->length != 3) {
+        monitor_binary_error(e_MON_ERR_CMD_INVALID_LENGTH, command->request_id);
+        return;
+    }
+    row = command->body[0];
+    column = command->body[1];
+    pressed = command->body[2];
+    if (row >= 8 || column >= 8 || pressed > 1) {
+        monitor_binary_error(e_MON_ERR_INVALID_PARAMETER, command->request_id);
+        return;
+    }
+    keyboard_set_keyarr(row, column, pressed);
+    monitor_binary_response(0, e_MON_RESPONSE_KEY_MATRIX_SET, e_MON_ERR_OK,
+                            command->request_id, NULL);
+}
+
+/* Set the emulated joystick contacts, independently of host I/O simulation. */
+static void monitor_binary_process_joystick_value_set(binary_command_t *command)
+{
+    uint8_t port, value;
+
+    if (command->length != 2) {
+        monitor_binary_error(e_MON_ERR_CMD_INVALID_LENGTH, command->request_id);
+        return;
+    }
+    port = command->body[0];
+    value = command->body[1];
+    if ((port != 1 && port != 2) || value > 0x1f) {
+        monitor_binary_error(e_MON_ERR_INVALID_PARAMETER, command->request_id);
+        return;
+    }
+    joystick_set_value_absolute(port - 1, value);
+    monitor_binary_response(0, e_MON_RESPONSE_JOYSTICK_VALUE_SET, e_MON_ERR_OK,
+                            command->request_id, NULL);
+}
+
 static void monitor_binary_process_userport_set(binary_command_t *command)
 {
     IO_SIM_RESULT ret;
@@ -1818,6 +1865,10 @@ static void monitor_binary_process_command(unsigned char * pbuffer)
 
     } else if (command_type == e_MON_CMD_JOYPORT_SET) {
         monitor_binary_process_joyport_set(&command);
+    } else if (command_type == e_MON_CMD_KEY_MATRIX_SET) {
+        monitor_binary_process_key_matrix_set(&command);
+    } else if (command_type == e_MON_CMD_JOYSTICK_VALUE_SET) {
+        monitor_binary_process_joystick_value_set(&command);
 
     } else if (command_type == e_MON_CMD_USERPORT_SET) {
         monitor_binary_process_userport_set(&command);
