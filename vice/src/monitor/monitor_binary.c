@@ -50,6 +50,7 @@
 #include "util.h"
 #include "vicesocket.h"
 #include "machine.h"
+#include "maincpu.h"
 #include "screenshot.h"
 #include "machine-video.h"
 #include "palette.h"
@@ -120,6 +121,7 @@ enum t_binary_command {
     e_MON_CMD_JOYPORT_SET = 0xa2,
     e_MON_CMD_KEY_MATRIX_SET = 0xa3,
     e_MON_CMD_JOYSTICK_VALUE_SET = 0xa4,
+    e_MON_CMD_CLOCK_GET = 0xa5,
 
     e_MON_CMD_USERPORT_SET = 0xb2,
 
@@ -171,6 +173,7 @@ enum t_binary_response {
     e_MON_RESPONSE_JOYPORT_SET = 0xa2,
     e_MON_RESPONSE_KEY_MATRIX_SET = 0xa3,
     e_MON_RESPONSE_JOYSTICK_VALUE_SET = 0xa4,
+    e_MON_RESPONSE_CLOCK_GET = 0xa5,
 
     e_MON_RESPONSE_USERPORT_SET = 0xb2,
 
@@ -1445,6 +1448,20 @@ static void monitor_binary_process_joystick_value_set(binary_command_t *command)
                             command->request_id, NULL);
 }
 
+/* Report the real main-CPU clock of the paused machine, without advancing it. */
+static void monitor_binary_process_clock_get(binary_command_t *command)
+{
+    unsigned char response[8];
+
+    if (command->length != 0) {
+        monitor_binary_error(e_MON_ERR_CMD_INVALID_LENGTH, command->request_id);
+        return;
+    }
+    write_uint64((uint64_t)maincpu_clk, response);
+    monitor_binary_response(sizeof response, e_MON_RESPONSE_CLOCK_GET, e_MON_ERR_OK,
+                            command->request_id, response);
+}
+
 static void monitor_binary_process_userport_set(binary_command_t *command)
 {
     IO_SIM_RESULT ret;
@@ -1869,6 +1886,8 @@ static void monitor_binary_process_command(unsigned char * pbuffer)
         monitor_binary_process_key_matrix_set(&command);
     } else if (command_type == e_MON_CMD_JOYSTICK_VALUE_SET) {
         monitor_binary_process_joystick_value_set(&command);
+    } else if (command_type == e_MON_CMD_CLOCK_GET) {
+        monitor_binary_process_clock_get(&command);
 
     } else if (command_type == e_MON_CMD_USERPORT_SET) {
         monitor_binary_process_userport_set(&command);
