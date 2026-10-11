@@ -10,6 +10,7 @@ import argparse
 import base64
 import hashlib
 import json
+import socket
 import socketserver
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,8 @@ METHODS = (
     "agent.capabilities", "emulator.info", "session.status", "state.get",
     "state.get_registers", "memory.read", "video.snapshot", "video.palette",
     "snapshot.save", "snapshot.load", "execution.pause", "execution.continue",
-    "execution.step", "input.keyboard", "input.joystick",
+    "execution.step", "execution.run_until", "breakpoints.create",
+    "breakpoints.list", "breakpoints.delete", "input.keyboard", "input.joystick",
 )
 REGISTERS = {0: "a", 1: "x", 2: "y", 3: "pc", 4: "sp", 5: "p",
              55: "raster_line", 56: "raster_cycle"}
@@ -54,6 +56,7 @@ class Service:
         self.paused = True
         self.revision = 0
         self.last_clock = self.monitor.clock()
+        self.breakpoints: dict[int, int] = {}
 
     def _pause(self) -> int:
         clock = self.monitor.clock()
@@ -122,6 +125,74 @@ class Service:
             self.monitor.step(count)
             self.revision += 1
             return self.state()
+        if method == "execution.run_until":
+            fields(params, {"address", "timeout_ms"})
+            self._require_paused()
+            address = integer(params.get("address"), 0, 65_535, "address")
+            timeout = integer(params.get("timeout_ms", 20_000), 1, 30_000, "timeout_ms")
+            # VICE resumes automatically when a temporary checkpoint is added.
+            checkpoint_id = self.monitor.checkpoint(address, temporary=True)
+            self.paused = False
+            previous_timeout = self.monitor.sock.gettimeout()
+            self.monitor.sock.settimeout(timeout / 1000)
+            try:
+                self.monitor.wait_stopped()
+            except socket.timeout as exc:
+                self.monitor.sock.settimeout(previous_timeout)
+                recent_events = self.monitor.events[-6:]
+                clock = self._pause()
+                try:
+                    info = self.monitor.checkpoint_info(checkpoint_id)
+                except RuntimeError:
+                    info = None
+                pc = self.state()["general"].get("pc")
+                if info:
+                    self.monitor.checkpoint_delete(checkpoint_id)
+                raise TimeoutError(
+                    f"checkpoint {checkpoint_id} not reached in {timeout} ms; "
+                    f"pc={pc:04x}, clock={clock}, checkpoint={info}, "
+                    f"events={recent_events}") from exc
+            finally:
+                self.monitor.sock.settimeout(previous_timeout)
+            self.paused = True
+            self.revision += 1
+            result = self.state()
+            if result["general"].get("pc") != address:
+                raise RuntimeError("VICE stopped at a different checkpoint")
+            result["checkpoint_id"] = checkpoint_id
+            return result
+        if method == "breakpoints.create":
+            fields(params, {"address", "kind", "once"})
+            self._require_paused()
+            address = integer(params.get("address"), 0, 65_535, "address")
+            if params.get("kind", "execution") != "execution":
+                raise InvalidParams("only execution breakpoints are supported")
+            once = params.get("once", False)
+            if type(once) is not bool:
+                raise InvalidParams("once must be boolean")
+            if once:
+                raise InvalidParams("use execution.run_until for a one-shot breakpoint")
+            checkpoint_id = self.monitor.checkpoint(address, temporary=False)
+            self.breakpoints[checkpoint_id] = address
+            self.revision += 1
+            return {"breakpoint_id": checkpoint_id, "address": address,
+                    "once": once, "state_revision": self.revision}
+        if method == "breakpoints.list":
+            fields(params, set())
+            self._require_paused()
+            return {"breakpoints": [{"breakpoint_id": key, "address": value}
+                                    for key, value in sorted(self.breakpoints.items())]}
+        if method == "breakpoints.delete":
+            fields(params, {"breakpoint_id"})
+            self._require_paused()
+            checkpoint_id = integer(params.get("breakpoint_id"), 1, 2**32 - 1,
+                                    "breakpoint_id")
+            if checkpoint_id not in self.breakpoints:
+                raise InvalidParams("unknown persistent breakpoint")
+            self.monitor.checkpoint_delete(checkpoint_id)
+            del self.breakpoints[checkpoint_id]
+            self.revision += 1
+            return {"deleted": checkpoint_id, "state_revision": self.revision}
         if method == "memory.read":
             fields(params, {"address", "length", "bank"})
             self._require_paused()

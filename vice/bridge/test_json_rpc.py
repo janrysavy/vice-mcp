@@ -54,6 +54,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--monitor-port", type=int, default=16502)
     parser.add_argument("--rpc-port", type=int, default=16503)
+    parser.add_argument("--load-snapshot", type=Path)
+    parser.add_argument("--run-until-address", type=lambda value: int(value, 0))
+    parser.add_argument("--capture-boundary", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -61,11 +64,12 @@ def main() -> None:
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     with (args.out / "vice.log").open("wb") as vice_log, \
             (args.out / "bridge.log").open("wb") as bridge_log:
-        vice = subprocess.Popen([
+        vice_command = [
             str(args.vice.resolve()), "-directory", str(args.data.resolve()),
             "-sounddev", "dummy", "-warp", "-binarymonitor",
             "-binarymonitoraddress", f"ip4://127.0.0.1:{args.monitor_port}",
-        ], env=env, stdout=vice_log, stderr=subprocess.STDOUT,
+        ]
+        vice = subprocess.Popen(vice_command, env=env, stdout=vice_log, stderr=subprocess.STDOUT,
             creationflags=creationflags)
         bridge = None
         sock = None
@@ -83,30 +87,81 @@ def main() -> None:
             capabilities = rpc.call("agent.capabilities")
             assert capabilities["transport"] == "JSON-RPC 2.0 TCP JSON-lines"
             assert rpc.call("session.status")["paused"]
+            if args.load_snapshot:
+                rpc.call("snapshot.load", path=str(args.load_snapshot.resolve()))
             initial = rpc.call("state.get")
+            if args.run_until_address is not None:
+                print(f"initial PC={initial['general'].get('pc'):04X} clock={initial['clock']}", flush=True)
+                first_counter = rpc.call("memory.read", address=0x48, length=1)
+                print(f"initial $48={base64.b64decode(first_counter['data_base64']).hex()}", flush=True)
             video = rpc.call("video.snapshot")
+            if args.run_until_address is not None:
+                print(f"video clock={video['clock']}", flush=True)
             pixels = base64.b64decode(video["data_base64"])
             assert (video["width"], video["height"], len(pixels)) == (320, 200, 64000)
             assert hashlib.sha256(pixels).hexdigest() == video["sha256"]
             memory = rpc.call("memory.read", address=0, length=256)
+            if args.run_until_address is not None:
+                print(f"memory clock={memory['clock']}", flush=True)
             assert len(base64.b64decode(memory["data_base64"])) == 256
-            rpc.call("input.keyboard", events=[{"key": "f7", "pressed": True}])
-            rpc.call("input.keyboard", events=[{"key": "f7", "pressed": False}])
-            rpc.call("input.joystick", port=2, mask=8)
-            rpc.call("input.joystick", port=2, mask=0)
+            if not args.load_snapshot:
+                rpc.call("input.keyboard", events=[{"key": "f7", "pressed": True}])
+                rpc.call("input.keyboard", events=[{"key": "f7", "pressed": False}])
+                rpc.call("input.joystick", port=2, mask=8)
+                rpc.call("input.joystick", port=2, mask=0)
+            if args.run_until_address is not None:
+                try:
+                    boundary = rpc.call("execution.run_until", address=args.run_until_address,
+                                        timeout_ms=3000)
+                except RuntimeError:
+                    stalled = rpc.call("execution.pause")
+                    counter = rpc.call("memory.read", address=0x48, length=1)
+                    failed_video = rpc.call("video.snapshot")
+                    (args.out / "stalled-indexed.bin").write_bytes(
+                        base64.b64decode(failed_video["data_base64"]))
+                    (args.out / "stalled-video.json").write_text(
+                        json.dumps({key: value for key, value in failed_video.items()
+                                    if key != "data_base64"}, indent=2) + "\n")
+                    failed_ram = rpc.call("memory.read", address=0, length=65536)
+                    (args.out / "stalled-ram.bin").write_bytes(
+                        base64.b64decode(failed_ram["data_base64"]))
+                    print(f"stalled PC={stalled['general'].get('pc'):04X} "
+                          f"clock={stalled['clock']} "
+                          f"$48={base64.b64decode(counter['data_base64']).hex()}", flush=True)
+                    raise
+                assert boundary["general"]["pc"] == args.run_until_address
+                if args.capture_boundary:
+                    boundary_video = rpc.call("video.snapshot")
+                    boundary_ram = rpc.call("memory.read", address=0, length=65536)
+                    boundary_vic = rpc.call("memory.read", address=0xD000, length=0x40)
+                    (args.out / "boundary-indexed.bin").write_bytes(
+                        base64.b64decode(boundary_video["data_base64"]))
+                    (args.out / "boundary-ram.bin").write_bytes(
+                        base64.b64decode(boundary_ram["data_base64"]))
+                    (args.out / "boundary-vic.bin").write_bytes(
+                        base64.b64decode(boundary_vic["data_base64"]))
+                    (args.out / "boundary.json").write_text(json.dumps({
+                        "state": boundary,
+                        "video": {key: value for key, value in boundary_video.items()
+                                  if key != "data_base64"},
+                        "ram_sha256": boundary_ram["sha256"],
+                        "vic_io_sha256": boundary_vic["sha256"],
+                    }, indent=2) + "\n")
             snapshot = rpc.call("snapshot.save", path=str(args.out / "rpc-test.vsf"))
-            assert snapshot["clock"] == initial["clock"]
+            if args.run_until_address is None:
+                assert snapshot["clock"] == initial["clock"]
             first = rpc.call("execution.step", count=20_000)
             first_video = rpc.call("video.snapshot")
             first_memory = rpc.call("memory.read", address=0, length=65536)
             restored = rpc.call("snapshot.load", path=snapshot["path"])
-            assert restored["clock"] == initial["clock"]
+            assert restored["clock"] == snapshot["clock"]
             second = rpc.call("execution.step", count=20_000)
             second_video = rpc.call("video.snapshot")
             second_memory = rpc.call("memory.read", address=0, length=65536)
             result = {
                 "capability_methods": len(capabilities["methods"]),
                 "initial_clock": initial["clock"],
+                "boundary_clock": snapshot["clock"],
                 "replay_clock": first["clock"],
                 "clock_equal": first["clock"] == second["clock"],
                 "registers_equal": first["general"] == second["general"],
