@@ -157,5 +157,3 @@ class ViceMonitor:
         if len(reply) != 8:
             raise ValueError("unexpected VICE clock response")
         return struct.unpack("<Q", reply)[0]
-
-
