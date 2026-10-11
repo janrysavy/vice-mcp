@@ -13,6 +13,7 @@ class ViceMonitor:
         self.sock.settimeout(20)
         self.request_id = 0
         self.events: list[dict] = []
+        self.last_request_events: list[dict] = []
 
     def close(self) -> None:
         self.sock.close()
@@ -29,6 +30,7 @@ class ViceMonitor:
     def request(self, command: int, body: bytes = b"") -> bytes:
         self.request_id += 1
         request_id = self.request_id
+        seen_events: list[dict] = []
         self.sock.sendall(b"\x02\x02" + struct.pack("<IIB", len(body), request_id, command) + body)
         while True:
             header = self._recv_exact(12)
@@ -39,12 +41,15 @@ class ViceMonitor:
                 raise ValueError(f"oversized VICE response: {length}")
             payload = self._recv_exact(length)
             if response_id == 0xFFFFFFFF:
-                self.events.append({"kind": kind, "body": payload.hex()})
+                event = {"kind": kind, "body": payload.hex()}
+                self.events.append(event)
+                seen_events.append(event)
                 continue
             if response_id != request_id:
                 raise ValueError(f"unexpected VICE response id {response_id}, wanted {request_id}")
             if error:
                 raise RuntimeError(f"VICE command {command:#x} failed: {error:#x}")
+            self.last_request_events = seen_events
             return payload
 
     def step(self, count: int) -> None:
@@ -65,6 +70,37 @@ class ViceMonitor:
             self.events.append({"kind": kind, "body": payload.hex()})
             if kind == 0x62:
                 return
+
+    def checkpoint(self, address: int, temporary: bool = True) -> int:
+        if not 0 <= address <= 65535:
+            raise ValueError("checkpoint address outside 64 KB")
+        body = struct.pack("<HHBBBB", address, address, 1, 1, 4, int(temporary))
+        response = self.request(0x12, body)
+        if len(response) != 23:
+            raise ValueError("short VICE checkpoint response")
+        if (struct.unpack_from("<H", response, 5)[0] != address or
+                response[9:13] != bytes((1, 1, 4, int(temporary)))):
+            raise ValueError("VICE checkpoint parameters were not applied")
+        return struct.unpack_from("<I", response)[0]
+
+    def checkpoint_delete(self, checkpoint_id: int) -> None:
+        self.request(0x13, struct.pack("<I", checkpoint_id))
+
+    def checkpoint_info(self, checkpoint_id: int) -> dict:
+        response = self.request(0x11, struct.pack("<I", checkpoint_id))
+        if len(response) != 23:
+            raise ValueError("short VICE checkpoint information")
+        return {
+            "id": struct.unpack_from("<I", response)[0],
+            "hit": bool(response[4]),
+            "start": struct.unpack_from("<H", response, 5)[0],
+            "end": struct.unpack_from("<H", response, 7)[0],
+            "stop": bool(response[9]),
+            "enabled": bool(response[10]),
+            "operation": response[11],
+            "temporary": bool(response[12]),
+            "hit_count": struct.unpack_from("<I", response, 13)[0],
+        }
 
     def registers(self) -> list[dict]:
         body = self.request(0x31, b"\x00")
